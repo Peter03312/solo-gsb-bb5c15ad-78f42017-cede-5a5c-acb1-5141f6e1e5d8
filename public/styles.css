@@ -285,6 +285,8 @@ tr.hist-stale { background: var(--warn-bg); }
 .lot-pick-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; flex-wrap: wrap; }
 .lot-pick-row .lot-mat { display: flex; align-items: center; gap: 4px; min-width: 230px; font-weight: normal; }
 .lot-pick-row .lot-select { min-width: 240px; padding: 3px 6px; }
+.lot-pick-row .qty-input { width: 90px; padding: 3px 6px; }
+b.neg { color: #c0392b; }
 
 /* ---------- 批号追溯 ---------- */
 .trace-form {

@@ -81,6 +81,10 @@ function initSchema(d) {
     -- 本次原料输入所属供应批号：可空 = 批号未知（旧事件只传 material_ids 的输入均记为未知）。
     -- 只对原料输入有意义；引用批次输入恒为 NULL。
     material_lot_id INTEGER REFERENCES material_lots(id),
+    -- 本次投料克数（正整数）：启用计量的批号（已登记期初实物结存）每行必填；
+    -- NULL = 未计量（未启用批号沿用原输入规则；启用批号在启用前已存在的旧输入保留 NULL，
+    -- 不计入领用，更正时必须补量）。
+    qty_grams INTEGER CHECK (qty_grams IS NULL OR qty_grams > 0),
     CHECK ((material_id IS NOT NULL AND batch_id IS NULL)
         OR (material_id IS NULL AND batch_id IS NOT NULL))
   );
@@ -292,9 +296,36 @@ function initSchema(d) {
     CHECK (start_time < end_time)
   );
 
+  -- 原料批号期初实物结存（仓管登记，每批号至多一次，只增不改）：
+  --   非负整数克数；登记即“启用计量”——此后该批号的每笔原料输入须填正整数克数。
+  --   未登记期初的批号未启用计量，投料输入沿用原规则（不填数量）。
+  CREATE TABLE IF NOT EXISTS lot_opening_balances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL UNIQUE REFERENCES material_lots(id),
+    qty_grams INTEGER NOT NULL CHECK (qty_grams >= 0), -- 期初实物结存（非负整数克）
+    registered_by TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    registered_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 原料批号入库流水（只增不改）：唯一入库单号，正整数克数；
+  --   仅可登记给已启用计量（已登记期初结存）的批号。
+  CREATE TABLE IF NOT EXISTS lot_inbound_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_no TEXT NOT NULL UNIQUE,       -- 入库单号（调用方提供，全局唯一）
+    lot_id INTEGER NOT NULL REFERENCES material_lots(id),
+    qty_grams INTEGER NOT NULL CHECK (qty_grams > 0), -- 入库克数（正整数）
+    received_at TEXT NOT NULL,             -- 入库时间（ISO，调用方提供）
+    received_by TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_events_time ON events(event_time, id);
   CREATE INDEX IF NOT EXISTS idx_process_inputs_event ON process_inputs(event_id);
   CREATE INDEX IF NOT EXISTS idx_material_lots_material ON material_lots(material_id);
+  CREATE INDEX IF NOT EXISTS idx_lot_opening_lot ON lot_opening_balances(lot_id);
+  CREATE INDEX IF NOT EXISTS idx_lot_inbound_lot ON lot_inbound_receipts(lot_id);
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_rolls_batch ON label_rolls(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_usages_roll ON label_roll_usages(roll_id);
@@ -326,6 +357,13 @@ function initSchema(d) {
     );
   }
   d.exec('CREATE INDEX IF NOT EXISTS idx_process_inputs_lot ON process_inputs(material_lot_id)');
+
+  // process_inputs.qty_grams：本次投料克数（正整数或 NULL=未计量）；
+  // 旧记录全部保持 NULL（未计量，不计入领用）。
+  if (!inputCols.includes('qty_grams')) {
+    d.exec('ALTER TABLE process_inputs ADD COLUMN qty_grams INTEGER');
+    // ALTER TABLE 补列无法带 CHECK：旧记录恒 NULL，正整数约束由写入侧（stock.js）强制。
+  }
 
   // events.clean_allergens：CLEAN 事件本次已核实去除的过敏原集合（NULL=全清，旧事件全部保持全清语义）。
   const eventCols = d.prepare('PRAGMA table_info(events)').all().map((c) => c.name);

@@ -351,10 +351,13 @@ function renderEvents() {
           ｜推导过敏原：<span class="tag-row" style="display:inline-flex">${allergenTags(ev.out_allergens)}</span>
         </div>
         <div class="event-inputs"><b>原料：</b>${mats.length ? mats.map((m) => {
+          const qty = m.qty_grams != null
+            ? `<span class="lot-badge known">${m.qty_grams} 克</span>`
+            : (m.material_lot_id ? '<span class="batch-meta">（旧输入未计量）</span>' : '');
           const lot = m.material_lot_code
             ? `<span class="lot-badge ${m.material_lot_status === 'FLAGGED' ? 'flagged' : 'known'}">批号 ${esc(m.material_lot_code)}${m.material_lot_status === 'FLAGGED' ? '（已通报异常）' : ''}</span>`
             : '<span class="lot-badge unknown">批号未知</span>';
-          return `${esc(m.material_name)}(${esc(m.material_code)}) ${lot}`;
+          return `${esc(m.material_name)}(${esc(m.material_code)}) ${lot}${qty}`;
         }).join('、') : '—'}
           ｜<b>引用批次：</b>${refs.length ? refs.map((r) => esc(r.ref_batch_code)).join('、') : '—'}</div>`;
     } else {
@@ -489,6 +492,8 @@ function fillEventModalOptions(ev) {
             <label class="lot-mat"><input type="checkbox" name="material_ids" value="${m.id}" checked>
               ${esc(m.name)} <span class="batch-meta">[${esc(m.allergens.join('/') || '无过敏原')}]</span></label>
             <select name="lot_id" class="lot-select" ${idx > 0 ? '' : ''}>${lotOptions(inp.material_lot_id)}</select>
+            <input type="number" min="1" step="1" name="qty_grams" class="qty-input" placeholder="克数"
+                   value="${inp.qty_grams != null ? esc(String(inp.qty_grams)) : ''}">
             <button type="button" class="btn small lot-add" data-material="${m.id}">＋ 同原料再加批号</button>
             <button type="button" class="btn small danger lot-del">移除</button>
           </div>`).join('')
@@ -496,6 +501,7 @@ function fillEventModalOptions(ev) {
            <label class="lot-mat"><input type="checkbox" name="material_ids" value="${m.id}" ${checked ? 'checked' : ''}>
              ${esc(m.name)} <span class="batch-meta">[${esc(m.allergens.join('/') || '无过敏原')}]</span></label>
            <select name="lot_id" class="lot-select">${lotOptions(null)}</select>
+           <input type="number" min="1" step="1" name="qty_grams" class="qty-input" placeholder="克数" value="">
            <button type="button" class="btn small lot-add" data-material="${m.id}">＋ 同原料再加批号</button>
            <button type="button" class="btn small danger lot-del" hidden>移除</button>
          </div>`;
@@ -516,6 +522,8 @@ $('#evMaterials').addEventListener('click', (e) => {
     const m = state.materials.find((x) => String(x.id) === String(mid));
     const clone = row.cloneNode(true);
     clone.querySelector('input[name="material_ids"]').checked = true;
+    const cloneQty = clone.querySelector('input[name="qty_grams"]');
+    if (cloneQty) cloneQty.value = '';
     clone.querySelector('.lot-del').hidden = false;
     row.parentElement.appendChild(clone);
     void m;
@@ -585,10 +593,18 @@ $('#eventForm').onsubmit = async (e) => {
     const cb = row.querySelector('input[name="material_ids"]');
     if (!cb.checked) return;
     const sel = row.querySelector('select.lot_id');
-    materialInputs.push({
+    const qtyInput = row.querySelector('input[name="qty_grams"]');
+    const qtyRaw = qtyInput ? qtyInput.value.trim() : '';
+    const item = {
       material_id: parseInt(row.dataset.material, 10),
       lot_id: sel && sel.value ? parseInt(sel.value, 10) : null
-    });
+    };
+    // 克数仅在填写时提交；是否必填/是否允许由后端按批号计量状态权威判定。
+    if (qtyRaw !== '') {
+      const n = Number(qtyRaw);
+      item.qty_grams = Number.isInteger(n) ? n : qtyRaw;
+    }
+    materialInputs.push(item);
   });
   const isPartialClean = f.type.value === 'CLEAN' && f.clean_mode && f.clean_mode.value === 'PARTIAL';
   const cleanAllergens = isPartialClean
@@ -1213,24 +1229,35 @@ function renderLots() {
   }
   rows.sort((a, b) =>
     a.m.code.localeCompare(b.m.code, 'zh') || a.l.lot_code.localeCompare(b.l.lot_code));
-  $('#lotRows').innerHTML = rows.length ? rows.map(({ m, l }) => `
+  $('#lotRows').innerHTML = rows.length ? rows.map(({ m, l }) => {
+    const stockCell = l.measured
+      ? `<div>期初 <b>${l.opening_grams}</b> ＋ 入库 <b>${l.inbound_grams}</b> － 领用 <b>${l.used_grams}</b> ＝ 可用 <b class="${l.available_grams < 0 ? 'neg' : ''}">${l.available_grams}</b> 克</div>` +
+        (l.unmeasured_input_count
+          ? `<div class="batch-meta">未计量旧输入 ${l.unmeasured_input_count} 笔（不计入领用，更正时补量）</div>` : '')
+      : '<span class="batch-meta">未启用计量（投料不填克数）</span>';
+    return `
     <tr>
       <td>${esc(m.name)} <span class="batch-meta">(${esc(m.code)})</span></td>
       <td>${esc(l.lot_code)}</td>
       <td>${esc(l.supplier || '')}</td>
+      <td>${stockCell}</td>
       <td>${l.flagged
         ? '<span class="badge invalid">FLAGGED 已通报异常</span>'
         : '<span class="badge active">正常</span>'}</td>
       <td>${esc(l.note || '')}${l.flagged_reason ? `<div class="batch-meta">${esc(l.flagged_reason)}</div>` : ''}</td>
       <td class="row-actions">
+        ${l.measured
+          ? `<button class="btn small" onclick="openInboundModal(${l.id})">登记入库</button>`
+          : `<button class="btn small" onclick="openOpeningModal(${l.id})">登记期初</button>`}
         <button class="btn small" onclick="traceLot(${m.id},${l.id})">追溯流向</button>
         ${l.flagged
           ? `<button class="btn small" onclick="unflagLot(${l.id})">解除标记</button>`
           : `<button class="btn small danger" onclick="flagLot(${l.id})">通报异常</button>`}
         <button class="btn small danger" onclick="deleteLot(${l.id})">删除</button>
       </td>
-    </tr>`).join('')
-    : '<tr><td colspan="6" class="batch-meta">尚无供应批号；点右上“登记供应批号”新增（旧投料默认批号未知）。</td></tr>';
+    </tr>`;
+  }).join('')
+    : '<tr><td colspan="7" class="batch-meta">尚无供应批号；点右上“登记供应批号”新增（旧投料默认批号未知）。</td></tr>';
 }
 
 $('#btnNewLot').onclick = () => {
@@ -1276,12 +1303,45 @@ window.unflagLot = async function (id) {
   } catch (err) { notice('error', err.error || '操作失败', err.details); }
 };
 window.deleteLot = async function (id) {
-  if (!confirm('删除该供应批号？已被投料记录引用的批号不能删除。')) return;
+  if (!confirm('删除该供应批号？已被投料引用、已登记期初结存或已有入库流水的批号不能删除。')) return;
   try {
     await api(`/api/material-lots/${id}`, { method: 'DELETE' });
     await refresh();
     notice('ok', '供应批号已删除');
   } catch (err) { notice('error', err.error || '删除失败', err.details); }
+};
+
+// 登记期初实物结存（非负整数克；每批号一次，只增不改；登记即启用计量）。
+window.openOpeningModal = async function (id) {
+  const qtyStr = prompt('期初实物结存（非负整数克，允许 0；每批号只可登记一次，登记即启用计量）：', '0');
+  if (qtyStr === null) return;
+  const qty = qtyStr.trim();
+  if (!/^\d+$/.test(qty)) { notice('error', '期初结存必须是非负整数'); return; }
+  const by = (prompt('登记人（可留空）：', '') || '').trim();
+  try {
+    await api(`/api/material-lots/${id}/opening-balance`, {
+      method: 'POST', body: { qty_grams: Number(qty), registered_by: by }
+    });
+    await refresh();
+    notice('ok', '期初结存已登记，该批号已启用计量；此后投料须填正整数克数');
+  } catch (err) { notice('error', err.error || '登记失败', err.details); }
+};
+
+// 登记入库（唯一入库单号、正整数克；流水只增不改）。
+window.openInboundModal = async function (id) {
+  const receipt_no = (prompt('入库单号（全局唯一，只增不改）：', '') || '').trim();
+  if (!receipt_no) return;
+  const qtyStr = (prompt('入库克数（正整数）：', '') || '').trim();
+  if (!/^[1-9]\d*$/.test(qtyStr)) { notice('error', '入库克数必须是正整数'); return; }
+  const received_at = (prompt('入库时间（YYYY-MM-DDTHH:MM，可留空取当前时间）：', '') || '').trim();
+  const received_by = (prompt('入库人（可留空）：', '') || '').trim();
+  try {
+    const body = { receipt_no, qty_grams: Number(qtyStr), received_by };
+    if (received_at) body.received_at = received_at;
+    await api(`/api/material-lots/${id}/inbound`, { method: 'POST', body });
+    await refresh();
+    notice('ok', `入库 ${qtyStr} 克已登记（单号 ${receipt_no}），可用量已增加`);
+  } catch (err) { notice('error', err.error || '入库失败（未产生流水）', err.details); }
 };
 
 // ================= 原料批号追溯 =================

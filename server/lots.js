@@ -145,6 +145,27 @@ function deleteLot(db, id) {
       '隔离令台账需完整保留，批号不能删除'
     );
   }
+  // 已登记期初结存或入库流水的批号不可删除：计量台账只增不改、必须完整保留。
+  const opening = db.prepare(
+    'SELECT COUNT(*) AS c FROM lot_opening_balances WHERE lot_id = ?'
+  ).get(id).c;
+  if (opening > 0) {
+    throw new LotError(
+      'LOT_IN_USE',
+      `供应批号 ${lot.lot_code}（${lot.material_code}）已登记期初实物结存（已启用计量），` +
+      '期初结存只增不改，批号不能删除'
+    );
+  }
+  const inbound = db.prepare(
+    'SELECT COUNT(*) AS c FROM lot_inbound_receipts WHERE lot_id = ?'
+  ).get(id).c;
+  if (inbound > 0) {
+    throw new LotError(
+      'LOT_IN_USE',
+      `供应批号 ${lot.lot_code}（${lot.material_code}）已有 ${inbound} 笔入库流水，` +
+      '入库流水只增不改，批号不能删除'
+    );
+  }
   db.prepare('DELETE FROM material_lots WHERE id = ?').run(id);
   return { ok: true, id };
 }
