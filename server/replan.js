@@ -160,7 +160,12 @@ function normalizeChanges(rawChanges) {
                 bad = true; return;
               }
             }
-            parsed.push({ material_id: mid, lot_id: lotIdRaw, lot_code: lotCodeRaw });
+            parsed.push({
+              material_id: mid, lot_id: lotIdRaw, lot_code: lotCodeRaw,
+              // 领用克数：已启用计量批号必填正整数（形状只透传，权威校验在写入侧/全量校验）。
+              qty_grams: inp.qty_grams !== undefined ? inp.qty_grams
+                : (inp.qty !== undefined ? inp.qty : undefined)
+            });
           });
           if (bad) return;
           norm.material_inputs = parsed;
@@ -278,6 +283,7 @@ function publicChanges(changes) {
             const lid = x.material_lot_id !== undefined ? x.material_lot_id : x.lot_id;
             if (lid != null) o.lot_id = lid;
             if (x.lot_code != null) o.lot_code = x.lot_code;
+            if (x.qty_grams !== undefined) o.qty_grams = x.qty_grams;
             return o;
           });
         }
@@ -360,7 +366,6 @@ const FINGERPRINT_SQL = [
   'SELECT id, code, name FROM equipment ORDER BY id',
   'SELECT id, event_time, type, equipment_id, batch_id, clean_allergens, note FROM events ORDER BY id',
   'SELECT id, code FROM batches ORDER BY id',
-  'SELECT id, event_id, material_id, batch_id, material_lot_id FROM process_inputs ORDER BY id',
   `SELECT id, batch_id, released_at, released_by, snapshot_allergens, status,
           invalid_reason, created_event_seq FROM releases ORDER BY id`,
   // 出货单/明细不影响推导结果，但会影响“将停用卷/待评估出货单”的预测，故一并纳入指纹：
@@ -382,7 +387,11 @@ const FINGERPRINT_SQL = [
   `SELECT id, order_code, lot_id, reason, status, issued_by, issued_at,
           lifted_by, lifted_at, lift_reason, lifted_scope_json
      FROM quarantine_orders ORDER BY id`,
-  'SELECT order_id, batch_id, classification, evidence_json FROM quarantine_scope ORDER BY order_id, batch_id'
+  'SELECT order_id, batch_id, classification, evidence_json FROM quarantine_scope ORDER BY order_id, batch_id',
+  // 批号期初结存 / 入库流水与输入克数：影响“按最终事件集核对累计领用”，纳入指纹。
+  'SELECT id, lot_id, quantity_grams, registered_by, registered_at, note FROM lot_opening_balances ORDER BY id',
+  'SELECT id, receipt_code, lot_id, quantity_grams, received_by, received_at, note FROM lot_inbound_receipts ORDER BY id',
+  'SELECT id, event_id, material_id, batch_id, material_lot_id, qty_grams FROM process_inputs ORDER BY id'
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -526,6 +535,53 @@ function diffSnapshots(before, after) {
   };
 }
 
+// ---------- 批号库存余额差异（预演只展示，不占用库存） ----------
+// 期初/入库流水不在换线变更范围内（只增不改），故供应总量恒定；这里只比较
+// 按最终事件集重算后的「累计领用 / 可用量 / 未计量旧输入数」变化。
+function lotBalanceMap(db) {
+  const inventory = require('./inventory');
+  const map = new Map();
+  for (const b of inventory.allBalances(db).lots) {
+    map.set(b.lot_id, b);
+  }
+  return map;
+}
+
+function diffLotInventory(beforeMap, afterMap) {
+  const lotInventory = [];
+  for (const [lotId, aft] of afterMap) {
+    const bef = beforeMap.get(lotId);
+    if (!bef) continue; // 换线不新增批号
+    const changed =
+      bef.used_qty !== aft.used_qty ||
+      bef.available_qty !== aft.available_qty ||
+      bef.unmeasured_input_count !== aft.unmeasured_input_count;
+    if (!changed) continue;
+    lotInventory.push({
+      lot_id: lotId,
+      lot_code: aft.lot_code,
+      material_id: aft.material_id,
+      material_code: aft.material_code,
+      metered: aft.metered,
+      opening_qty: aft.opening_qty,
+      inbound_qty: aft.inbound_qty,
+      before_used_qty: bef.used_qty,
+      after_used_qty: aft.used_qty,
+      used_delta: (aft.used_qty || 0) - (bef.used_qty || 0),
+      before_available_qty: bef.available_qty,
+      after_available_qty: aft.available_qty,
+      available_delta: (aft.available_qty == null || bef.available_qty == null)
+        ? null : aft.available_qty - bef.available_qty,
+      before_unmeasured_input_count: bef.unmeasured_input_count,
+      after_unmeasured_input_count: aft.unmeasured_input_count
+    });
+  }
+  lotInventory.sort((a, b) =>
+    a.material_code.localeCompare(b.material_code, 'zh') ||
+    a.lot_code.localeCompare(b.lot_code, 'zh'));
+  return lotInventory;
+}
+
 // ---------- 引用解析（设备/原料/批次是否存在、事件是否存在） ----------
 function resolveChangeRefs(db, changes) {
   const errors = [];
@@ -595,7 +651,7 @@ function resolveChangeRefs(db, changes) {
               lotId = lot.id;
             }
           }
-          return { material_id: inp.material_id, material_lot_id: lotId };
+          return { material_id: inp.material_id, material_lot_id: lotId, qty_grams: inp.qty_grams };
         });
       }
       for (const bid of c.ref_batch_ids) {
@@ -612,6 +668,20 @@ function resolveChangeRefs(db, changes) {
   if (errors.length) {
     throw new ReplanError('REPLAN_REJECTED', '整组变更引用的档案不存在', errors);
   }
+
+  // 计量写入侧形状校验：已启用批号的输入必须带正整数克数；未启用批号 / 批号未知不得携带克数。
+  // 余额总量由 validateAll 在影子库/事务内按最终事件集核对（余额不足整次拒绝）。
+  const inventory = require('./inventory');
+  const qtyErrors = [];
+  for (const c of resolved) {
+    if (c.op !== 'update' || c.type !== 'PROCESS' || !Array.isArray(c.material_inputs)) continue;
+    qtyErrors.push(
+      ...inventory.checkWrittenInputs(db, c.material_inputs, `事件 #${c.event_id} material_inputs`)
+    );
+  }
+  if (qtyErrors.length) {
+    throw new ReplanError('INVALID_REQUEST', '整组变更的原料输入计量信息不合法', qtyErrors);
+  }
   return resolved;
 }
 
@@ -627,7 +697,7 @@ function applyChangesTo(db, resolved) {
   const delInputs = db.prepare('DELETE FROM process_inputs WHERE event_id=?');
   const insMatInput = db.prepare('INSERT INTO process_inputs (event_id, material_id) VALUES (?,?)');
   const insMatLotInput = db.prepare(
-    'INSERT INTO process_inputs (event_id, material_id, material_lot_id) VALUES (?,?,?)'
+    'INSERT INTO process_inputs (event_id, material_id, material_lot_id, qty_grams) VALUES (?,?,?,?)'
   );
   const insBatchInput = db.prepare('INSERT INTO process_inputs (event_id, batch_id) VALUES (?,?)');
 
@@ -639,7 +709,8 @@ function applyChangesTo(db, resolved) {
       delInputs.run(c.event_id);
       if (Array.isArray(c.material_inputs)) {
         for (const inp of c.material_inputs) {
-          insMatLotInput.run(c.event_id, inp.material_id, inp.material_lot_id);
+          insMatLotInput.run(c.event_id, inp.material_id, inp.material_lot_id,
+            inp.qty_grams !== undefined ? inp.qty_grams : null);
         }
       } else {
         for (const mid of c.material_ids) insMatInput.run(c.event_id, mid);
@@ -681,7 +752,7 @@ function openShadow(sourceDb) {
   copy('equipment', 'id,code,name');
   copy('batches', 'id,code');
   copy('events', 'id,event_time,type,equipment_id,batch_id,clean_allergens,note');
-  copy('process_inputs', 'id,event_id,material_id,batch_id,material_lot_id');
+  copy('process_inputs', 'id,event_id,material_id,batch_id,material_lot_id,qty_grams');
   copy('batch_outputs', 'batch_id,allergens,paths_json');
   copy('equipment_residue', 'equipment_id,allergens,paths_json,last_cleaned_at');
   copy('releases', 'id,batch_id,released_at,released_by,snapshot_allergens,status,invalid_reason,created_event_seq');
@@ -696,6 +767,9 @@ function openShadow(sourceDb) {
   // 质量隔离令与生效范围一并拷入：预演按整组变更后的时间线重算隔离范围并预测级联。
   copy('quarantine_orders', 'id,order_code,lot_id,reason,status,issued_by,issued_at,lifted_by,lifted_at,lift_reason,lifted_scope_json,created_at');
   copy('quarantine_scope', 'order_id,batch_id,classification,evidence_json');
+  // 批号库存台账（期初/入库流水只增不改）：影子库据此核对累计领用并计算余额差异。
+  copy('lot_opening_balances', 'id,lot_id,quantity_grams,registered_by,registered_at,note,created_at');
+  copy('lot_inbound_receipts', 'id,receipt_code,lot_id,quantity_grams,received_by,received_at,note,created_at');
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
@@ -766,6 +840,10 @@ function simulate(db, changes) {
     diff.summary.shipments_will_pending = pendingShipments.length;
     diff.dispositions_will_stale = staleDispositions;
     diff.summary.dispositions_will_stale = staleDispositions.length;
+    // 批号库存余额差异：预演只展示各批号领用/可用量变化，不占用库存。
+    const lotInventory = diffLotInventory(lotBalanceMap(db), lotBalanceMap(shadow));
+    diff.lot_inventory = lotInventory;
+    diff.summary.lot_inventory_changed = lotInventory.length;
     // 质量隔离令：整组变更后生效范围的变化（新受控 / 脱离受控的批次）。
     diff.quarantine_will_control = recomputeResult.quarantine.newly_controlled;
     diff.quarantine_will_release = recomputeResult.quarantine.released;
@@ -826,6 +904,7 @@ function apply(db, body) {
       );
     }
     const before = takeSnapshot(db);
+    const lotBalBefore = lotBalanceMap(db);
     const inserted = applyChangesTo(db, resolved);
 
     const errors = validateAll(db);
@@ -835,6 +914,11 @@ function apply(db, body) {
     const { invalidated, retiredRolls, pendingShipments, staleDispositions, quarantine } = recompute(db);
     const after = takeSnapshot(db);
     const appliedDiff = diffSnapshots(before, after);
+    // 批号库存：确认应用在同一事务内按最终事件重算领用（余额不足已在 validateAll 整次拒绝），
+    // 差异随落库结果返回；预演不占用库存。
+    const lotInventory = diffLotInventory(lotBalBefore, lotBalanceMap(db));
+    appliedDiff.lot_inventory = lotInventory;
+    appliedDiff.summary.lot_inventory_changed = lotInventory.length;
     appliedDiff.label_rolls_will_retire = retiredRolls.map((r) => ({
       roll_id: r.id, roll_code: r.roll_code, batch_code: r.batch_code,
       reason: r.reason, applied_pending_review: r.applied_pending_review

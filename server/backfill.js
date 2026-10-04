@@ -64,13 +64,19 @@ function recordCanonical(rec, { withExternalRef }) {
       : null;
   } else {
     base.batch_code = rec.batch_code;
+    // 旧版本台账的规范化记录没有 qty_grams 字段：为保持“同号同内容跨版本复用”哈希一致，
+    // 仅当确有克数时才写入该字段（无数量=省略，与历史记录的键集合一致）。
     base.material_inputs = (rec.material_inputs || [])
       .slice()
       .sort((a, b) =>
         a.material_id - b.material_id ||
         (a.material_lot_id == null ? -1 : b.material_lot_id == null ? 1
           : a.material_lot_id - b.material_lot_id))
-      .map((x) => ({ material_id: x.material_id, material_lot_id: x.material_lot_id }));
+      .map((x) => {
+        const o = { material_id: x.material_id, material_lot_id: x.material_lot_id };
+        if (x.qty_grams != null) o.qty_grams = x.qty_grams;
+        return o;
+      });
     base.ref_batch_codes = (rec.ref_batch_codes || []).slice().sort();
   }
   return canonicalString(base);
@@ -97,7 +103,8 @@ function externalCanonicalRecord(rec) {
     base.material_inputs = (rec.material_inputs || []).map((x) => ({
       material: ref(x.material),
       lot_id: x.lot_id,
-      lot_code: x.lot_code
+      lot_code: x.lot_code,
+      qty_raw: x.qty_raw === undefined ? null : x.qty_raw
     }));
     base.ref_batches = (rec.ref_batches || []).map(ref);
   }
@@ -233,7 +240,23 @@ function normalizeRequest(body) {
               lotCode = String(inp.lot_code).trim();
               if (!lotCode) { errors.push(`${w}：lot_code 不能为空`); return; }
             }
-            rec.material_inputs.push({ material: mat, lot_id: lotId, lot_code: lotCode });
+            // 领用克数（缺省=未提供）：已启用计量批号在解析/全量校验阶段要求正整数。
+            // 数字按数字透传（避免字符串化导致“相同内容重试”哈希漂移）；字符串仅允许纯数字。
+            const qtyRaw = inp.qty_grams !== undefined ? inp.qty_grams
+              : (inp.qty !== undefined ? inp.qty : undefined);
+            if (qtyRaw !== undefined && qtyRaw !== null && qtyRaw !== '') {
+              const n = typeof qtyRaw === 'number'
+                ? (Number.isInteger(qtyRaw) ? qtyRaw : NaN)
+                : (/^\d+$/.test(String(qtyRaw).trim()) ? parseInt(String(qtyRaw).trim(), 10) : NaN);
+              if (!Number.isInteger(n) || n <= 0) {
+                errors.push(`${w}：领用克数 qty_grams 必须是大于 0 的正整数`);
+                return;
+              }
+            }
+            rec.material_inputs.push({
+              material: mat, lot_id: lotId, lot_code: lotCode,
+              qty_raw: qtyRaw === undefined || qtyRaw === null || qtyRaw === '' ? null : qtyRaw
+            });
           });
         }
       }
@@ -397,7 +420,14 @@ function resolveReferences(db, records, knownExternalRefs) {
           }
         }
       }
-      if (material_id != null) out.material_inputs.push({ material_id, material_lot_id });
+      if (material_id != null) {
+        out.material_inputs.push({
+          material_id,
+          material_lot_id,
+          qty_grams: inp.qty_raw == null ? null
+            : (typeof inp.qty_raw === 'number' ? inp.qty_raw : parseInt(String(inp.qty_raw).trim(), 10))
+        });
+      }
     }
 
     // 引用批次解析：库内既有批次按 id/编码解析；包内更早产出的批次先放行，
@@ -493,19 +523,22 @@ function normalizeResolvedRecord(rec) {
       : null;
   } else {
     out.batch_code = rec.batch_code;
-    // 同 (原料, 批号) 的重复投料行按一行计（与单条事件接口的去重口径一致，
+    // 同 (原料, 批号, 克数) 的重复投料行按一行计（与单条事件接口的去重口径一致，
     // 避免补录后经单条接口重写产生的行差异被误判为内容不符）。
     const inputKeys = new Set();
     out.material_inputs = [];
     for (const x of (rec.material_inputs || [])) {
-      const key = `${x.material_id}|${x.material_lot_id == null ? '' : x.material_lot_id}`;
+      const key = `${x.material_id}|${x.material_lot_id == null ? '' : x.material_lot_id}|${x.qty_grams == null ? '' : x.qty_grams}`;
       if (inputKeys.has(key)) continue;
       inputKeys.add(key);
-      out.material_inputs.push({ material_id: x.material_id, material_lot_id: x.material_lot_id });
+      const o = { material_id: x.material_id, material_lot_id: x.material_lot_id };
+      if (x.qty_grams != null) o.qty_grams = x.qty_grams;
+      out.material_inputs.push(o);
     }
     out.material_inputs.sort((a, b) =>
       a.material_id - b.material_id ||
-      ((a.material_lot_id || 0) - (b.material_lot_id || 0)));
+      ((a.material_lot_id || 0) - (b.material_lot_id || 0)) ||
+      ((a.qty_grams || 0) - (b.qty_grams || 0)));
     out.ref_batch_codes = [...new Set(rec.ref_batch_codes || [])].sort();
   }
   return out;
@@ -567,6 +600,21 @@ function submitBackfill(db, rawBody) {
   const knownExternalRefs = collectKnownExternalRefs(db, normalized);
 
   const resolvedRaw = resolveReferences(db, normalized, knownExternalRefs);
+  // 计量写入侧校验（只对本次将新写入的记录；复用既有事件的记录不重复领用、也不参与校验）。
+  // 已启用批号的输入必须带正整数克数；未启用批号 / 批号未知不得携带克数。
+  // 必须在 knownExternalRefs 判定之后跳过“同号复用”的记录：复用不写入事件、不重复领用。
+  const inventory = require('./inventory');
+  const qtyErrors = [];
+  resolvedRaw.forEach((rec) => {
+    if (rec.type !== 'PROCESS' || knownExternalRefs.has(rec.external_ref)) return;
+    qtyErrors.push(
+      ...inventory.checkWrittenInputs(db, rec.material_inputs,
+        `records[${rec.seq}]（外部记录号 ${rec.external_ref}）material_inputs`)
+    );
+  });
+  if (qtyErrors.length) {
+    throw new BackfillError('BACKFILL_REJECTED', '补录包原料输入的计量信息不合法（整包拒绝，不写台账）', qtyErrors);
+  }
   const resolved = resolvedRaw.map(normalizeResolvedRecord);
   const packageHash = hashOf(canonicalString(resolved.map((r) =>
     recordCanonical(r, { withExternalRef: true }))));
@@ -592,7 +640,7 @@ function submitBackfill(db, rawBody) {
       'INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note) VALUES (?,?,?,?,?,?)'
     );
     const insMatInput = db.prepare(
-      'INSERT INTO process_inputs (event_id, material_id, material_lot_id) VALUES (?,?,?)'
+      'INSERT INTO process_inputs (event_id, material_id, material_lot_id, qty_grams) VALUES (?,?,?,?)'
     );
     const insBatchInput = db.prepare('INSERT INTO process_inputs (event_id, batch_id) VALUES (?,?)');
 
@@ -627,7 +675,8 @@ function submitBackfill(db, rawBody) {
       ).lastInsertRowid;
       if (rec.type === 'PROCESS') {
         for (const inp of rec.material_inputs) {
-          insMatInput.run(eid, inp.material_id, inp.material_lot_id);
+          insMatInput.run(eid, inp.material_id, inp.material_lot_id,
+            inp.qty_grams == null ? null : inp.qty_grams);
         }
         for (const code of rec.ref_batch_codes) {
           insBatchInput.run(eid, batchIdByCode.get(code));
@@ -757,7 +806,9 @@ function getBackfill(db, code) {
       base.material_inputs = (stored.material_inputs || []).map((x) => ({
         material_id: x.material_id,
         material_lot_id: x.material_lot_id,
-        lot_known: x.material_lot_id != null
+        lot_known: x.material_lot_id != null,
+        qty_grams: x.qty_grams == null ? null : x.qty_grams,
+        measured: x.qty_grams != null
       }));
       base.ref_batch_codes = stored.ref_batch_codes || [];
     }
@@ -821,8 +872,12 @@ function currentCanonical(db, ev) {
     const b = db.prepare('SELECT code FROM batches WHERE id = ?').get(ev.batch_id);
     rec.batch_code = b ? b.code : null;
     rec.material_inputs = db.prepare(
-      'SELECT material_id, material_lot_id FROM process_inputs WHERE event_id = ? AND material_id IS NOT NULL'
-    ).all(ev.id).map((x) => ({ material_id: x.material_id, material_lot_id: x.material_lot_id }));
+      'SELECT material_id, material_lot_id, qty_grams FROM process_inputs WHERE event_id = ? AND material_id IS NOT NULL'
+    ).all(ev.id).map((x) => {
+      const o = { material_id: x.material_id, material_lot_id: x.material_lot_id };
+      if (x.qty_grams != null) o.qty_grams = x.qty_grams;
+      return o;
+    });
     rec.ref_batch_codes = db.prepare(
       `SELECT b.code AS code FROM process_inputs pi
          JOIN batches b ON b.id = pi.batch_id

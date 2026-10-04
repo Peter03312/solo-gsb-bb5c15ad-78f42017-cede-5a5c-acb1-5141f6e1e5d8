@@ -273,6 +273,33 @@ function initSchema(d) {
     PRIMARY KEY (order_id, batch_id)
   );
 
+  -- 供应批号期初实物结存（计量启用点）：仓管可为“已有”供应批号登记一次非负整数克数的
+  --   期初实物结存；一个批号至多一行（部分唯一索引/唯一约束强制），重复登记拒绝。
+  --   登记即视为该批号“启用计量”：此后该批号的每笔原料输入须填正整数克数，
+  --   按批号累计领用不得超过「期初 + 入库」之和；期初行只增不改（无修改/删除接口）。
+  CREATE TABLE IF NOT EXISTS lot_opening_balances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL REFERENCES material_lots(id),
+    quantity_grams INTEGER NOT NULL CHECK (quantity_grams >= 0), -- 期初实物结存（非负整数克）
+    registered_by TEXT NOT NULL DEFAULT '',
+    registered_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 供应批号入库流水：每笔入库以唯一入库单号（receipt_code）记录正整数克数。
+  --   启用计量后的入库流水只增不改：无修改/删除接口；重复入库单号整次拒绝且不产生部分流水。
+  CREATE TABLE IF NOT EXISTS lot_inbound_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_code TEXT NOT NULL UNIQUE,       -- 唯一入库单号，如 IN-0001（调用方可指定，否则服务端补发）
+    lot_id INTEGER NOT NULL REFERENCES material_lots(id),
+    quantity_grams INTEGER NOT NULL CHECK (quantity_grams > 0), -- 入库克数（正整数）
+    received_by TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   -- 设备检修停机窗口：检修期间不能记录加工或清洗。
   --   窗口为左闭右开区间 [start_time, end_time)，起点须早于终点；
   --   同设备窗口不可重叠（相邻允许：一个的终点可等于另一个的起点）；
@@ -314,6 +341,9 @@ function initSchema(d) {
   CREATE UNIQUE INDEX IF NOT EXISTS idx_quarantine_active_lot
     ON quarantine_orders(lot_id) WHERE status = 'ACTIVE';
   CREATE INDEX IF NOT EXISTS idx_quarantine_scope_batch ON quarantine_scope(batch_id);
+  -- 期初结存每批号至多一行；入库流水按批号索引（入库单号表级 UNIQUE 已全局唯一）。
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_lot_opening_lot ON lot_opening_balances(lot_id);
+  CREATE INDEX IF NOT EXISTS idx_lot_inbound_lot ON lot_inbound_receipts(lot_id);
   `);
 
   // ---- 旧库迁移（CREATE TABLE IF NOT EXISTS 不会为既有表补列）----
@@ -326,6 +356,13 @@ function initSchema(d) {
     );
   }
   d.exec('CREATE INDEX IF NOT EXISTS idx_process_inputs_lot ON process_inputs(material_lot_id)');
+
+  // process_inputs.qty_grams：启用计量后该笔原料输入的领用克数（正整数）。
+  // 旧事件输入与未启用计量批号的输入恒为 NULL：保留且不计入领用；更正这些输入时须补量。
+  if (!inputCols.includes('qty_grams')) {
+    d.exec('ALTER TABLE process_inputs ADD COLUMN qty_grams INTEGER');
+  }
+  d.exec('CREATE INDEX IF NOT EXISTS idx_process_inputs_qty ON process_inputs(material_lot_id, qty_grams)');
 
   // events.clean_allergens：CLEAN 事件本次已核实去除的过敏原集合（NULL=全清，旧事件全部保持全清语义）。
   const eventCols = d.prepare('PRAGMA table_info(events)').all().map((c) => c.name);

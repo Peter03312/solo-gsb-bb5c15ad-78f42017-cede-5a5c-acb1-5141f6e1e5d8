@@ -22,6 +22,13 @@
 原料资料或事件更正、补录、换线或清洗后同步刷新；**受控批次不得登记放行、标签卷或确认出货**，
 已有卷暂停贴用但不永久停用，关联已出货单转待评估、有效的继续流转结论转需重评、**隔离期间只能召回**；
 解除或流向变化使批次**脱离所有生效令后**才恢复后续操作，待评估单及历史处置不自动恢复。
+仓管可为已有原料供应批号登记**一次非负整数克数的期初实物结存**，并以**唯一入库单号**记录后续
+**正整数克数入库**（启用计量后入库流水只增不改）；启用计量后新增、断网补录或更正加工事件时，
+该批号的每笔原料输入须填**正整数克数**，按批号累计领用不得超过**期初与入库之和**，未启用批号
+沿用原输入规则；**旧事件缺数量的输入保留且不计入领用，更正时须补量**。事件删除、更正及整组
+换线确认在同一事务按最终事件重算领用，**余额不足整次拒绝、原事件与库存不变**，换线预演只展示
+各批号余额差异、不占用库存；断网补录同内容重试或复用既有外部记录不重复领用；台账可查各批号
+**期初、入库、领用、可用量及未计量旧输入数**，非法数量、重复期初或入库单号均拒绝且不产生部分流水。
 
 - 后端：Node.js + Express
 - 数据库：SQLite（[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)，数据文件本地保存）
@@ -1182,6 +1189,178 @@ curl -s http://localhost:3000/api/quarantine-orders/1
 | 隔离期间提交“准予继续流转” | 409 | `CONTINUE_NOT_ALLOWED` |
 | 批号已签发隔离令（含历史令）仍删除 | 400 | `LOT_IN_USE` |
 
+## 批号库存计量（克）：期初结存 · 入库流水 · 领用余额（本轮新增）
+
+仓管对**已有原料供应批号**启用克数计量：先登记一次**期初实物结存**，再凭**唯一入库单号**
+登记后续入库；加工事件的该批号原料输入按正整数克数领用，系统按最终事件集核对余额。
+
+### 规则
+
+- **期初实物结存**：每个供应批号**只能登记一次**，数量为**非负整数克数（允许 0）**；
+  登记即视为该批号**启用计量**。期初记录只增不改（无修改/删除接口），重复登记整次拒绝。
+- **入库流水**：启用计量后凭**唯一入库单号**登记**正整数克数**入库；单号可调用方指定，
+  省略时服务端补发 `IN-0001` 形态单号。**入库流水只增不改**；重复单号整次拒绝且不产生部分流水。
+  未登记期初（未启用计量）的批号不能登记入库。
+- **加工领用（新增、断网补录、更正加工事件）**：
+  - 已启用计量批号的**每笔**原料输入都必须填写**正整数克数**（字段 `qty_grams`，别名 `qty`）；
+    按批号**累计领用（所有现存事件输入克数之和）不得超过「期初 + 入库」之和**；
+  - **未启用计量的批号沿用原输入规则**（不填克数）；**批号未知**的输入同样不填克数，填了即拒绝；
+  - **旧事件缺少数量的输入保留且不计入领用**；启用计量后这些输入标为“未计量旧输入”，
+    **更正这些输入时必须补量**（不补量的更正整次拒绝）。
+- **事件删除、更正及整组换线确认**：在**同一事务**中按**最终事件集**重算领用，
+  余额不足则**整次拒绝且原事件、库存不变**（不产生半条输入/流水）；
+  **换线预演只展示各批号余额差异**（`diff.lot_inventory`：领用/可用量前后值与差值），
+  **不占用库存**，余额不足在预演阶段即拒绝。
+- **断网补录**：已计量批号的补录输入同样须带正整数克数；**相同补录批号+同内容重试**
+  或**跨包复用既有外部记录号**都**不重复领用**（不重复写入事件即不重复占用）；
+  整包超额整包回滚，不留事件也不留台账。
+- **查询**：`GET /api/lot-inventory` 返回各批号**期初、入库、领用、可用量及未计量旧输入数**；
+  `GET /api/material-lots/:id/inventory` 返回单批号台账（含期初与逐笔入库流水）；
+  `/api/state` 的 `lot_inventory`/`lot_inventory_summary` 与 `materials[].lots[]`
+  摘要同样含上述字段，事件 `inputs[]` 另含 `qty_grams`/`measured`。
+- 已登记期初或已有入库流水的批号**不可删除**（台账只增不改，返回 `400 LOT_IN_USE`）。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/material-lots/:id/opening-balance` | 登记一次期初实物结存（`quantity_grams` 非负整数、`registered_by`、`registered_at?`、`note?`），返回该批号台账 |
+| `POST /api/material-lots/:id/inbound` | 登记入库（`quantity_grams` 正整数、`received_by`、`receipt_code?` 省略则补发、`received_at?`、`note?`），返回入库单与最新台账 |
+| `GET /api/material-lots/:id/inventory` | 单批号台账：期初/入库合计/领用/可用量/未计量旧输入数，含期初与逐笔入库流水 |
+| `GET /api/lot-inventory` | 全部批号库存台账与汇总（`summary.lot_count/metered_lot_count/unmeasured_input_count`） |
+| `POST /api/events`、`PUT /api/events/:id` | `material_inputs[]` 每项新增可选 `qty_grams`（正整数）；已计量批号必填，未计量/批号未知不得填 |
+| `POST /api/backfills` | 加工记录 `material_inputs[]` 同样支持 `qty_grams`；重试/复用不重复领用 |
+| `POST /api/replan/preview`、`POST /api/replan/apply` | `update` 加工事件的 `material_inputs[]` 支持 `qty_grams`；预演 `diff.lot_inventory` 只展示余额差异，确认同事务重算 |
+| `GET /api/state` | 顶层 `lot_inventory`/`lot_inventory_summary`；`materials[].lots[]` 含 `metered/opening_qty/inbound_qty/used_qty/available_qty/unmeasured_input_count`；事件 `inputs[]` 含 `qty_grams/measured` |
+
+期初/入库请求体：
+
+```json
+// POST /api/material-lots/:id/opening-balance
+{ "quantity_grams": 10000, "registered_by": "仓管-周杰",
+  "registered_at": "2026-09-29T18:00", "note": "盘点期初实物结存" }
+
+// POST /api/material-lots/:id/inbound（receipt_code 省略时自动补发 IN-0001…）
+{ "receipt_code": "IN-20261001-07", "quantity_grams": 5000,
+  "received_by": "仓管-周杰", "received_at": "2026-10-01T07:30", "note": "早班到货" }
+```
+
+加工事件的带量输入（与既有 `material_inputs` 同形状，仅每项多一个正整数克数）：
+
+```json
+{ "type": "PROCESS", "event_time": "2026-10-01T08:00", "equipment_id": 1,
+  "batch_code": "BATCH-006",
+  "material_inputs": [
+    { "material_id": 3, "lot_id": 1, "qty_grams": 2000 },
+    { "material_id": 4 }
+  ],
+  "ref_batch_ids": [] }
+```
+
+### 调用示例（curl，基于演示数据批号）
+
+```bash
+# 0) 取得演示批号 id（全脂奶粉 SUP-MILK-20260925-A/#1、面粉 SUP-WHEAT-20260920-7/#3）
+curl -s http://localhost:3000/api/material-lots
+
+# 1) 登记期初实物结存（非负整数克，每批号一次；0 克也允许）
+curl -s -X POST http://localhost:3000/api/material-lots/1/opening-balance \
+  -H 'Content-Type: application/json' -d '{
+    "quantity_grams": 10000, "registered_by": "仓管-周杰",
+    "registered_at": "2026-09-29T18:00", "note": "盘点期初实物结存" }'
+# -> { lot_id:1, metered:true, opening_qty:10000, inbound_qty:0,
+#      used_qty:0, available_qty:10000, unmeasured_input_count:0, opening:{...}, inbound:[] }
+
+# 2) 重复登记期初 -> 409，非法数量（负数/小数/非数字）-> 400
+curl -s -X POST http://localhost:3000/api/material-lots/1/opening-balance \
+  -H 'Content-Type: application/json' -d '{"quantity_grams":500,"registered_by":"周杰"}'
+# -> { error:"供应批号 SUP-MILK-20260925-A（MILK-01）已登记过期初实物结存，…",
+#      code:"OPENING_ALREADY_REGISTERED" }
+
+# 3) 登记入库：指定唯一单号 + 正整数克（省略单号自动补发 IN-0001）
+curl -s -X POST http://localhost:3000/api/material-lots/1/inbound \
+  -H 'Content-Type: application/json' -d '{
+    "receipt_code":"IN-20261001-07","quantity_grams":5000,
+    "received_by":"仓管-周杰","note":"早班到货" }'
+# -> { receipt_code:"IN-20261001-07", quantity_grams:5000,
+#      balance:{ opening_qty:10000, inbound_qty:5000, used_qty:0, available_qty:15000, ... } }
+
+# 4) 重复入库单号 -> 409，且不产生部分流水（入库合计/笔数不变）
+curl -s -X POST http://localhost:3000/api/material-lots/1/inbound \
+  -H 'Content-Type: application/json' -d '{"receipt_code":"IN-20261001-07","quantity_grams":1,"received_by":"x"}'
+# -> { error:"入库单号 \"IN-20261001-07\" 已存在：…整次拒绝、不产生入库流水",
+#      code:"RECEIPT_CODE_CONFLICT" }
+
+# 5) 已计量批号的加工输入必须带正整数克数；不带 -> 400
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-10-01T08:00","equipment_id":1,"batch_code":"BATCH-X1",
+  "material_inputs":[{"material_id":3,"lot_id":1}],"ref_batch_ids":[]}'
+# -> { code:"INVALID_REQUEST",
+#      details:["material_inputs[0]：供应批号 SUP-MILK-20260925-A 已启用计量（已登记期初结存），
+#               该批号的每笔原料输入都必须填写正整数克数 qty_grams；旧输入缺少数量时，更正该输入须补量"] }
+
+# 6) 带量领用成功；累计领用超过 期初+入库 -> 整次拒绝，原事件与库存不变
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-10-01T08:00","equipment_id":1,"batch_code":"BATCH-X1",
+  "material_inputs":[{"material_id":3,"lot_id":1,"qty_grams":2000},{"material_id":4}],"ref_batch_ids":[]}'
+# -> { id:..., invalidated:[], ... }
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-10-01T09:00","equipment_id":1,"batch_code":"BATCH-X2",
+  "material_inputs":[{"material_id":3,"lot_id":1,"qty_grams":99999}],"ref_batch_ids":[]}'
+# -> { error:"提交被拒绝（整次提交已回滚）",
+#      details:["供应批号 SUP-MILK-20260925-A（MILK-01）余额不足：按最终事件集累计领用 101999 克…
+#               超过期初 10000 克与入库合计 5000 克之和 15000 克；整次拒绝，原事件与库存不变"] }
+
+# 7) 未启用计量批号 / 批号未知 不得填克数
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' -d '{
+  "type":"PROCESS","event_time":"2026-10-01T10:00","equipment_id":2,"batch_code":"BATCH-X3",
+  "material_inputs":[{"material_id":7,"qty_grams":10}],"ref_batch_ids":[]}'
+# -> 400 INVALID_REQUEST（批号未知的原料输入不能填写克数）
+
+# 8) 查询：全部批号台账（期初/入库/领用/可用量/未计量旧输入数）与单批号流水
+curl -s http://localhost:3000/api/lot-inventory
+# -> { summary:{ lot_count:4, metered_lot_count:1, unmeasured_input_count:6 },
+#      lots:[{ lot_id:1, lot_code:"SUP-MILK-20260925-A", metered:true,
+#               opening_qty:10000, inbound_qty:5000, used_qty:2000, available_qty:13000,
+#               unmeasured_input_count:0, opening:{...}, inbound:[{receipt_code:"IN-20261001-07",...}] }] }
+curl -s http://localhost:3000/api/material-lots/1/inventory
+
+# 9) 整组换线预演：只展示批号余额差异，不占用库存
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d '{
+    "changes":[{"op":"update","event_id":10,"type":"PROCESS",
+      "event_time":"2026-10-01T08:00","equipment_id":1,"batch_code":"BATCH-X1",
+      "material_inputs":[{"material_id":3,"lot_id":1,"qty_grams":3000},{"material_id":4}],
+      "ref_batch_ids":[]}]}'
+# -> diff.lot_inventory:[{ lot_code:"SUP-MILK-20260925-A",
+#      before_used_qty:2000, after_used_qty:3000, used_delta:1000,
+#      before_available_qty:13000, after_available_qty:12000, available_delta:-1000 }]
+#    预演期间 GET 库存仍为 used 2000；确认应用（原样回传 version+changes）后才变为 3000。
+
+# 10) 断网补录：带克数；同内容重试/复用外部记录号不重复领用
+curl -s -X POST http://localhost:3000/api/backfills -H 'Content-Type: application/json' -d '{
+  "backfill_code":"BF-MILK-1","records":[
+    {"external_ref":"D-1","type":"PROCESS","event_time":"2026-10-02T08:00","equipment_id":1,
+     "batch_code":"BATCH-BF-1",
+     "material_inputs":[{"material_id":3,"lot_id":1,"qty_grams":400}]}]}'
+# 同 backfill_code 同内容再提交 -> idempotent:true，领用不增加；
+# 换新包但复用 external_ref "D-1"（同内容）-> impact_summary.reused_events:1，仍不重复领用。
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 期初数量非非负整数（负数/小数/非数字/空）、入库数量非正整数、缺操作人、时间格式错、单号字符合法性 | 400 | `INVALID_REQUEST` |
+| 已计量批号输入缺克数/克数非正整数、未计量批号或批号未知携带克数 | 400 | `INVALID_REQUEST`（事件）/`BACKFILL_REJECTED`（补录）/`REPLAN_REJECTED`（换线） |
+| 累计领用超过「期初+入库」（新增/更正/补录/换线确认，按最终事件集） | 400 | 事件为 `details` 内“余额不足”；补录 `BACKFILL_REJECTED`；换线 `REPLAN_REJECTED` |
+| 批号不存在（期初/入库/台账） | 404 | `LOT_NOT_FOUND` |
+| 重复登记期初 | 409 | `OPENING_ALREADY_REGISTERED` |
+| 未启用计量批号登记入库 | 400 | `LOT_NOT_METERED` |
+| 入库单号重复（不产生部分流水） | 409 | `RECEIPT_CODE_CONFLICT` |
+| 已登记期初/已有入库流水的批号删除 | 400 | `LOT_IN_USE` |
+
+> 计量是**领用余额**口径，与过敏原推导、放行、标签卷、出货、隔离令等互不影响；
+> 计量写入与事件一样走整次事务，任何非法数量或余额不足都不会留下半成品数据。
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -1225,6 +1404,7 @@ npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清�
 npm run test:backfill     # 端到端验证断网日志整包补录：整包事务/包内引用/幂等重试/外部记录号复用与冲突/重算联动（放行/卷/出货/处置）/对账（OK/MISMATCH/DELETED）/旧接口兼容
 npm run test:downtime     # 端到端验证设备检修停机窗口：登记/调整/取消/查询、左闭右开与相邻允许、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗
 npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重复拒绝、生效范围（确定命中+批号未知无法排除）与传播依据、受控约束（放行/卷/出货/暂停贴用/读侧可出货量统一为 0）、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复（余额按未停用卷剩余已贴量恢复，停用卷恒 0）
+npm run test:inventory    # 端到端验证批号库存计量（克）：期初一次非负整数/入库唯一单号正整数/流水只增不改、已计量批号输入必填正整数克数且累计领用≤期初+入库、未启用批号沿用旧规则、旧输入缺数量保留不计领用且更正须补量、事件更正/删除/补录/换线确认同事务重算余额不足整次拒绝、换线预演只展示不占用、补录重试/复用不重复领用、台账查询字段
 ```
 
 ## 访问地址与端口
@@ -1266,9 +1446,13 @@ npm run test:quarantine   # 端到端验证质量隔离令：签发/解除/重�
   点击「质量评估处置」可查看**出货快照与当前状态对比、准予条件判定**，
   按整单提交**准予继续流转/召回**（操作人、依据、查询状态版本；过期拒绝、记录只增不改），
   页面可查**当前结论（含“需重新评估”标记）与全部历史**。
-- **事件时间线**：按时间排列全部加工/清洗事件，展示输入（含每个原料输入的供应批号，未知批号明确标注）、引用批次与推导结果；
+- **事件时间线**：按时间排列全部加工/清洗事件，展示输入（含每个原料输入的供应批号与**领用克数**，
+  已计量输入标注克数、已计量批号的旧输入明确标“缺数量·未计领用”，未知批号明确标注）、引用批次与推导结果；
   清洗事件展示**清洗范围**（全清 / 部分清洗去除的过敏原集合）与**清洗后残留**（部分清洗后仍滞留、将继续进入后续批次的过敏原）；
-  “更正”可修改早期事件（原料可逐行选择批号，同原料可“＋ 同原料再加批号”录入多个批号；清洗可切换全清/部分清洗并填写已去除过敏原），保存时整单校验并触发重算。
+  “更正”可修改早期事件（原料可逐行选择批号并对已计量批号填写正整数克数，同原料可“＋ 同原料再加批号”录入多个批号；清洗可切换全清/部分清洗并填写已去除过敏原），保存时整单校验并触发重算。
+- **批号库存（克）**：按原料/批号展示**期初、入库、领用、可用量（克）与未计量旧输入数**；
+  可为未启用批号登记一次非负整数克**期初结存**（登记即启用计量）、为已计量批号凭唯一入库单号登记
+  正整数克**入库**（流水只增不改），并展开查看该批号的期初与逐笔入库流水；可用量为 0 红色标注。
 - **原料批号追溯**：选择原料与供应批号（或“批号未知”）查询流向，分区展示**确定命中**与**因批号未知无法排除**
   的批次（各自传播依据链、传播方式与关联出货单）以及最后清洗后仍可能滞留批号的设备残留；可从“原料与设备”
   页的批号行一键“追溯流向”。追溯只读，不改动任何业务结论。
@@ -1303,9 +1487,10 @@ server/
   trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留；全清截断、部分清洗按来源过敏原逐次截断）、确定命中与批号未知无法排除、关联出货单
   backfill.js    # 断网日志整包补录：有序记录（外部记录号/时间/设备，加工含产出批次/原料批号可未知/引用批次，清洗省略范围=全清非空=部分）；整包事务校验+重算；同批号同内容幂等、同号复用/冲突拒绝；补录批号对账（OK/MISMATCH/DELETED）
   quarantine.js  # 质量隔离令：签发/解除（原因/操作人/时间留痕，同批号同时一张生效令）；按当前时间线批号流向确定生效范围（确定命中+批号未知无法排除，含传播依据）并随重算同步刷新；受控批次禁放行/禁登记卷/禁出货、已有卷暂停贴用（不永久停用）、关联出货单转待评估、有效继续流转结论转需重评、隔离期间只能召回；脱离所有生效令后恢复
-  replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号）
+  inventory.js   # 批号库存计量（克）：期初实物结存（每批号一次、非负整数）、入库流水（唯一单号、正整数、只增不改）；按批号累计领用≤期初+入库的写入侧校验与最终状态全量校验；台账（期初/入库/领用/可用量/未计量旧输入数）
+  replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号与克数；预演 diff.lot_inventory 只展示批号余额差异不占用库存）
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单、两个相邻检修停机窗口）
-  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账、/api/downtime-windows 停机窗口、/api/quarantine-orders 质量隔离令）
+  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账、/api/downtime-windows 停机窗口、/api/quarantine-orders 质量隔离令、/api/material-lots/:id/opening-balance|inbound|inventory 与 /api/lot-inventory 批号库存计量）
 public/
   index.html  styles.css  app.js
 scripts/
@@ -1319,5 +1504,6 @@ scripts/
   test-backfill.js   # 断网日志整包补录：整包事务/包内引用/幂等/外部记录号复用与冲突/重算联动/对账/旧接口兼容 端到端测试
   test-downtime.js   # 设备检修停机窗口：登记/调整/取消/查询、重叠与相邻、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗 端到端测试
   test-quarantine.js # 质量隔离令：签发/解除/重复拒绝、生效范围与传播依据、受控约束、待评估与需重评级联、隔离期间只能召回、范围同步刷新、解除后恢复 端到端测试
+  test-inventory.js  # 批号库存计量（克）：期初/入库/非法与重复拒绝、必填正整数克数与累计领用余额、旧输入补量、更正删除补录换线同事务重算与预演不占用、重试复用不重复领用、台账查询 端到端测试
 Dockerfile  docker-compose.yml
 ```

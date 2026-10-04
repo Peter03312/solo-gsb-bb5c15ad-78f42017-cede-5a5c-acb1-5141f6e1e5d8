@@ -318,3 +318,9 @@ li.trace-trunc { color: #888; list-style: none; margin-left: -16px; }
 .clean-mode-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-weight: normal; }
 #evCleanAllergens { margin-top: 6px; width: 100%; }
 .event-item.clean { border-left: 3px solid var(--accent, #4f7cc7); }
+
+/* 批号库存（克） */
+.inv-zero { color: var(--danger, #c0392b); }
+.inv-detail { margin-top: 18px; }
+.lot-pick-row .lot-qty { padding: 3px 6px; }
+.lot-pick-row .lot-qty-hint { min-width: 86px; }

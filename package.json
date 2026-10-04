@@ -15,7 +15,8 @@
     "test:partial-clean": "node scripts/test-partial-clean.js",
     "test:backfill": "node scripts/test-backfill.js",
     "test:downtime": "node scripts/test-downtime.js",
-    "test:quarantine": "node scripts/test-quarantine.js"
+    "test:quarantine": "node scripts/test-quarantine.js",
+    "test:inventory": "node scripts/test-inventory.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

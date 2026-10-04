@@ -145,13 +145,35 @@ function deleteLot(db, id) {
       '隔离令台账需完整保留，批号不能删除'
     );
   }
+  // 已启用计量（期初结存/入库流水只增不改）的批号台账需完整保留，不可删除。
+  const opening = db.prepare(
+    'SELECT COUNT(*) AS c FROM lot_opening_balances WHERE lot_id = ?'
+  ).get(id).c;
+  if (opening > 0) {
+    throw new LotError(
+      'LOT_IN_USE',
+      `供应批号 ${lot.lot_code}（${lot.material_code}）已登记期初实物结存并启用计量，` +
+      '期初结存与入库流水只增不改，批号不能删除'
+    );
+  }
+  const inbound = db.prepare(
+    'SELECT COUNT(*) AS c FROM lot_inbound_receipts WHERE lot_id = ?'
+  ).get(id).c;
+  if (inbound > 0) {
+    throw new LotError(
+      'LOT_IN_USE',
+      `供应批号 ${lot.lot_code}（${lot.material_code}）已有 ${inbound} 笔入库流水，入库流水只增不改，批号不能删除`
+    );
+  }
   db.prepare('DELETE FROM material_lots WHERE id = ?').run(id);
   return { ok: true, id };
 }
 
 // ---------- 投料解析（事件写入 / 整组换线共用） ----------
-// 把 { material_id, lot_id?, lot_code? } 数组解析为
-// { material_id, material_lot_id }（未知批号 material_lot_id=null）。
+// 把 { material_id, lot_id?, lot_code?, qty_grams? } 数组解析为
+// { material_id, material_lot_id, qty_raw }（未知批号 material_lot_id=null）。
+// qty_raw 仅原样透传（缺省 undefined），是否必填/合法由 inventory.checkWrittenInputs
+// 按“该批号是否已启用计量”权威校验；本函数只负责批号档案。
 // 不合法（批号不存在、批号与原料不匹配）抛 LotError，由调用方在事务外拒绝。
 function resolveMaterialInputs(db, rawInputs) {
   const lotById = new Map();
@@ -176,8 +198,7 @@ function resolveMaterialInputs(db, rawInputs) {
     let material_lot_id = null;
 
     const hasLotId = inp.lot_id !== undefined && inp.lot_id !== null && inp.lot_id !== '';
-    const hasLotCode = inp.lot_code !== undefined && inp.lot_code !== null && inp.lot_code !== '';
-    if (hasLotId && hasLotCode) {
+    const hasLotCode = inp.lot_code !== undefined && inp.lot_code !== null && inp.lot_code !== '';    if (hasLotId && hasLotCode) {
       throw new LotError('INVALID_REQUEST', `${where}：lot_id 与 lot_code 只能提供其一`);
     }
     if (hasLotId) {
@@ -209,7 +230,12 @@ function resolveMaterialInputs(db, rawInputs) {
       }
       material_lot_id = row.id;
     }
-    resolved.push({ material_id, material_lot_id });
+    resolved.push({
+      material_id,
+      material_lot_id,
+      qty_raw: inp.qty_grams !== undefined ? inp.qty_grams
+        : (inp.qty !== undefined ? inp.qty : undefined)
+    });
   });
   return resolved;
 }

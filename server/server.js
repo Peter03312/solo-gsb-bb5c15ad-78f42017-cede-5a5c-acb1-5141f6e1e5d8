@@ -13,6 +13,7 @@ const lots = require('./lots');
 const backfill = require('./backfill');
 const downtime = require('./downtime');
 const quarantine = require('./quarantine');
+const inventory = require('./inventory');
 const { traceMaterial } = require('./trace');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -37,6 +38,25 @@ app.get('/api/state', (req, res) => {
   const quarByBatch = quarantine.controlledOrdersByBatch(db);
   const quarByLot = quarantine.activeOrdersByLot(db);
 
+  // 批号库存台账（期初/入库/领用/可用量/未计量旧输入数），整页状态只需各批号摘要。
+  const inventoryData = inventory.allBalances(db);
+  const invByLot = new Map(inventoryData.lots.map((l) => [l.lot_id, l]));
+  const inventoryBrief = (lotId) => {
+    const b = invByLot.get(lotId);
+    if (!b) {
+      return { metered: false, opening_qty: null, inbound_qty: null, used_qty: 0,
+        available_qty: null, unmeasured_input_count: 0 };
+    }
+    return {
+      metered: b.metered,
+      opening_qty: b.opening_qty,
+      inbound_qty: b.inbound_qty,
+      used_qty: b.used_qty,
+      available_qty: b.available_qty,
+      unmeasured_input_count: b.unmeasured_input_count
+    };
+  };
+
   const materials = db.prepare(
     'SELECT id, code, name, allergens FROM materials ORDER BY code'
   ).all().map((m) => ({
@@ -50,7 +70,9 @@ app.get('/api/state', (req, res) => {
       flagged: l.status === 'FLAGGED',
       // 该批号当前是否有生效中的质量隔离令（FLAGGED 异常标记仍只作留痕，互不影响）。
       quarantine_active: quarByLot.has(l.id),
-      active_quarantine_order: quarByLot.has(l.id) ? quarByLot.get(l.id).order_code : null
+      active_quarantine_order: quarByLot.has(l.id) ? quarByLot.get(l.id).order_code : null,
+      // 库存计量：期初/入库/领用/可用量及未计量旧输入数（未启用批号 metered=false、可用量 null）。
+      ...inventoryBrief(l.id)
     }))
   }));
 
@@ -132,7 +154,7 @@ app.get('/api/state', (req, res) => {
     out_allergens: ev.out_allergens ? JSON.parse(ev.out_allergens) : [],
     out_paths: ev.out_paths ? JSON.parse(ev.out_paths) : {},
     inputs: db.prepare(
-      `SELECT pi.material_id, pi.batch_id AS ref_batch_id, pi.material_lot_id,
+      `SELECT pi.material_id, pi.batch_id AS ref_batch_id, pi.material_lot_id, pi.qty_grams,
               m.name AS material_name, m.code AS material_code,
               m.allergens AS material_allergens,
               rb.code AS ref_batch_code,
@@ -153,6 +175,9 @@ app.get('/api/state', (req, res) => {
       material_allergens: r.material_allergens ? JSON.parse(r.material_allergens) : null,
       material_lot_code: r.material_lot_code,
       material_lot_status: r.material_lot_status,
+      // 领用克数：已计量输入为正整数；旧输入/未启用批号/批号未知为 null（不计入领用）。
+      qty_grams: r.qty_grams,
+      measured: r.material_id != null && r.qty_grams != null,
       ref_batch_code: r.ref_batch_code
     }))
   }));
@@ -229,7 +254,14 @@ app.get('/api/state', (req, res) => {
   // 质量隔离令台账（生效令含当前受控批次清单；传播依据见单条查询接口）。
   const quarantine_orders = quarantine.listOrders(db);
 
-  res.json({ materials, equipment, events, batches, label_rolls, shipments: shipments_list, downtime_windows, quarantine_orders });
+  // 批号库存台账（各批号期初/入库/领用/可用量及未计量旧输入数）。
+  const lot_inventory = inventoryData.lots;
+
+  res.json({
+    materials, equipment, events, batches, label_rolls,
+    shipments: shipments_list, downtime_windows, quarantine_orders, lot_inventory,
+    lot_inventory_summary: inventoryData.summary
+  });
 });
 
 // ---------- 通用：在事务中写事件集 -> 校验 -> 重算 ----------
@@ -466,6 +498,52 @@ function sendLotError(res, err) {
   return badRequest(res, err);
 }
 
+// ---------- 批号库存计量（期初结存 / 入库流水 / 台账查询） ----------
+// 期初：每批号一次非负整数克；入库：唯一入库单号 + 正整数克，流水只增不改。
+app.post('/api/material-lots/:id/opening-balance', (req, res) => {
+  try {
+    res.json(inventory.registerOpening(db, parseInt(req.params.id, 10), req.body || {}));
+  } catch (err) { sendInventoryError(res, err); }
+});
+
+app.post('/api/material-lots/:id/inbound', (req, res) => {
+  try {
+    res.json(inventory.createInbound(db, parseInt(req.params.id, 10), req.body || {}));
+  } catch (err) { sendInventoryError(res, err); }
+});
+
+app.get('/api/material-lots/:id/inventory', (req, res) => {
+  try {
+    const bal = inventory.lotBalance(db, parseInt(req.params.id, 10));
+    if (!bal) {
+      return res.status(404).json({ error: '供应批号不存在', code: 'LOT_NOT_FOUND' });
+    }
+    res.json(bal);
+  } catch (err) { sendInventoryError(res, err); }
+});
+
+// 全部批号库存台账：各批号期初/入库/领用/可用量及未计量旧输入数。
+app.get('/api/lot-inventory', (req, res) => {
+  res.json(inventory.allBalances(db));
+});
+
+function sendInventoryError(res, err) {
+  if (err && err.name === 'InventoryError') {
+    if (err.code === 'LOT_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code, details: err.details });
+    }
+    const conflict = err.code === 'OPENING_ALREADY_REGISTERED' ||
+      err.code === 'RECEIPT_CODE_CONFLICT';
+    return res.status(conflict ? 409 : 400).json({
+      error: err.message,
+      code: err.code,
+      details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
+
 // ---------- 原料供应批号流向追溯（只读） ----------
 // GET /api/trace/material-lot?material_id=&lot_id= 或 &lot_code=
 // 省略批号参数 = 查询“该原料批号未知”而无法排除的流向。
@@ -564,6 +642,16 @@ app.post('/api/events', (req, res) => {
     materialInputs = body.material_inputs !== undefined
       ? lots.resolveMaterialInputs(db, body.material_inputs)
       : body.material_ids.map((material_id) => ({ material_id, material_lot_id: null }));
+    // 计量规则（写入侧形状校验）：已启用批号的输入必须带正整数克数；
+    // 未启用批号 / 批号未知不得携带克数。余额总量在事务内按最终事件集重算。
+    const qtyErrors = inventory.checkWrittenInputs(db, materialInputs, 'material_inputs');
+    if (qtyErrors.length) {
+      return res.status(400).json({
+        error: '原料输入计量信息不合法（整次提交已拒绝）',
+        code: 'INVALID_REQUEST',
+        details: qtyErrors
+      });
+    }
     const { ret, invalidated, retired_rolls, pending_shipments, stale_dispositions, quarantine: quar } = mutateEvents((d) => {
       let batchId = null;
       if (body.type === 'PROCESS') {
@@ -581,8 +669,8 @@ app.post('/api/events', (req, res) => {
       if (body.type === 'PROCESS') {
         for (const inp of materialInputs) {
           d.prepare(
-            'INSERT INTO process_inputs (event_id, material_id, material_lot_id) VALUES (?,?,?)'
-          ).run(eid, inp.material_id, inp.material_lot_id);
+            'INSERT INTO process_inputs (event_id, material_id, material_lot_id, qty_grams) VALUES (?,?,?,?)'
+          ).run(eid, inp.material_id, inp.material_lot_id, inp.qty_grams);
         }
         for (const bid of body.ref_batch_ids) {
           d.prepare('INSERT INTO process_inputs (event_id, batch_id) VALUES (?,?)')
@@ -610,6 +698,16 @@ app.put('/api/events/:id', (req, res) => {
         ? lots.resolveMaterialInputs(db, body.material_inputs)
         : body.material_ids.map((material_id) => ({ material_id, material_lot_id: null })))
       : [];
+    if (body.type === 'PROCESS') {
+      const qtyErrors = inventory.checkWrittenInputs(db, materialInputs, 'material_inputs');
+      if (qtyErrors.length) {
+        return res.status(400).json({
+          error: '原料输入计量信息不合法（整次提交已拒绝）',
+          code: 'INVALID_REQUEST',
+          details: qtyErrors
+        });
+      }
+    }
     const { invalidated, retired_rolls, pending_shipments, stale_dispositions, quarantine: quar } = mutateEvents((d) => {
       if (body.type === 'PROCESS') {
         d.prepare('UPDATE batches SET code=? WHERE id=?')
@@ -617,8 +715,8 @@ app.put('/api/events/:id', (req, res) => {
         d.prepare('DELETE FROM process_inputs WHERE event_id=?').run(existing.id);
         for (const inp of materialInputs) {
           d.prepare(
-            'INSERT INTO process_inputs (event_id, material_id, material_lot_id) VALUES (?,?,?)'
-          ).run(existing.id, inp.material_id, inp.material_lot_id);
+            'INSERT INTO process_inputs (event_id, material_id, material_lot_id, qty_grams) VALUES (?,?,?,?)'
+          ).run(existing.id, inp.material_id, inp.material_lot_id, inp.qty_grams);
         }
         for (const bid of body.ref_batch_ids) {
           d.prepare('INSERT INTO process_inputs (event_id, batch_id) VALUES (?,?)')
@@ -761,7 +859,10 @@ function normalizeEventBody(body, isUpdate = false) {
         return {
           material_id: mid,
           lot_id: inp.lot_id !== undefined ? inp.lot_id : undefined,
-          lot_code: inp.lot_code !== undefined ? inp.lot_code : undefined
+          lot_code: inp.lot_code !== undefined ? inp.lot_code : undefined,
+          // 领用克数（正整数）：仅已启用计量批号必填；是否必填由 inventory 模块按批号校验。
+          qty_grams: inp.qty_grams !== undefined ? inp.qty_grams
+            : (inp.qty !== undefined ? inp.qty : undefined)
         };
       });
       // 同时携带旧式 material_ids 时，二者原料集合必须一致（防止调用方误以为旧字段仍生效）。

@@ -112,6 +112,12 @@ function validateAll(db) {
     );
   }
 
+  // 5. 批号库存计量：按最终事件集重算每批号累计领用（缺数量旧输入不计），
+  //    不得超过「期初 + 入库」；未启用计量批号不得携带克数（防御性核对）。
+  //    新增/更正/补录/换线确认均经此路径，余额不足整次拒绝、原事件与库存不变。
+  const inventory = require('./inventory');
+  errors.push(...inventory.validateInventory(db));
+
   return errors;
 }
 

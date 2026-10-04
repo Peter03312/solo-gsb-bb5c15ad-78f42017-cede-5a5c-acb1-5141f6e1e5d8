@@ -17,6 +17,7 @@
   <button class="tab" data-tab="labels">过敏原标签卷</button>
   <button class="tab" data-tab="shipments">包装出货</button>
   <button class="tab" data-tab="trace">原料批号追溯</button>
+  <button class="tab" data-tab="inventory">批号库存（克）</button>
   <button class="tab" data-tab="events">事件时间线（加工 / 清洗）</button>
   <button class="tab" data-tab="downtime">检修停机</button>
   <button class="tab" data-tab="base">原料与设备</button>
@@ -111,6 +112,31 @@
       </div>
     </form>
     <div id="traceResult" class="trace-result"></div>
+  </section>
+
+  <!-- ============ 批号库存（克） ============ -->
+  <section id="tab-inventory" class="tab-panel">
+    <div class="panel-head">
+      <h2>原料供应批号库存台账（克）</h2>
+    </div>
+    <p class="section-hint">
+      仓管可为已有供应批号登记<b>一次</b>非负整数克数的<b>期初实物结存</b>（登记即启用计量），
+      并以<b>唯一入库单号</b>登记后续正整数克数入库（启用计量后流水只增不改）。
+      启用计量后该批号的每笔原料输入须填<b>正整数克数</b>，按批号累计领用不得超过
+      <b>期初 + 入库</b>之和；未启用批号沿用原输入规则。
+      旧事件缺少数量的输入保留且<b>不计入领用</b>，更正这些输入时须补量。
+      事件新增/更正/删除与整组换线确认在同一事务按最终事件重算领用，<b>余额不足整次拒绝</b>；
+      换线预演只展示余额差异、不占用库存。
+    </p>
+    <div id="invSummary" class="batch-meta"></div>
+    <table class="grid">
+      <thead><tr>
+        <th>原料</th><th>供应批号</th><th>计量</th><th>期初（克）</th><th>入库（克）</th>
+        <th>领用（克）</th><th>可用量（克）</th><th>未计量旧输入</th><th></th>
+      </tr></thead>
+      <tbody id="invRows"></tbody>
+    </table>
+    <div id="invDetail" class="inv-detail"></div>
   </section>
 
   <!-- ============ 事件视图 ============ -->
@@ -441,6 +467,61 @@
       <div class="modal-actions">
         <button type="button" class="btn" data-close>取消</button>
         <button type="submit" class="btn primary">登记批号</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============ 批号期初结存弹窗 ============ -->
+<div id="openingModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>登记期初实物结存（每批号仅一次，非负整数克）</h3>
+    <form id="openingForm">
+      <input type="hidden" name="lot_id">
+      <div class="form-row"><label>供应批号</label><input type="text" name="lot_label" readonly></div>
+      <div class="form-row">
+        <label>期初实物结存（克）<span class="req">*</span></label>
+        <input type="number" name="quantity_grams" min="0" step="1" required placeholder="非负整数，允许 0">
+        <small class="hint">登记后该批号即“启用计量”：其每笔原料输入须填正整数克数，期初结存只登记一次。</small>
+      </div>
+      <div class="form-row"><label>操作人 <span class="req">*</span></label>
+        <input type="text" name="registered_by" required placeholder="姓名/工号"></div>
+      <div class="form-row"><label>登记时间</label>
+        <input type="datetime-local" name="registered_at"></div>
+      <div class="form-row align-top"><label>备注</label>
+        <input type="text" name="note" placeholder="如：盘点期初实物结存"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="submit" class="btn primary">登记期初结存（不可重复登记）</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============ 批号入库弹窗 ============ -->
+<div id="inboundModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>登记入库（唯一入库单号，正整数克；流水只增不改）</h3>
+    <form id="inboundForm">
+      <input type="hidden" name="lot_id">
+      <div class="form-row"><label>供应批号</label><input type="text" name="lot_label" readonly></div>
+      <div class="form-row">
+        <label>入库单号</label>
+        <input type="text" name="receipt_code" placeholder="留空由系统补发 IN-0001…；填写则须全局唯一">
+      </div>
+      <div class="form-row">
+        <label>入库克数 <span class="req">*</span></label>
+        <input type="number" name="quantity_grams" min="1" step="1" required placeholder="正整数克">
+      </div>
+      <div class="form-row"><label>操作人 <span class="req">*</span></label>
+        <input type="text" name="received_by" required placeholder="姓名/工号"></div>
+      <div class="form-row"><label>入库时间</label>
+        <input type="datetime-local" name="received_at"></div>
+      <div class="form-row align-top"><label>备注</label>
+        <input type="text" name="note" placeholder="如：早班到货入库"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="submit" class="btn primary">登记入库（单号重复整次拒绝）</button>
       </div>
     </form>
   </div>

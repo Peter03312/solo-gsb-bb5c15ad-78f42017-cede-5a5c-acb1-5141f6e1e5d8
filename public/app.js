@@ -80,6 +80,7 @@ async function refresh() {
   renderEvents();
   renderBase();
   renderLots();
+  renderInventory();
   renderDowntime();
 }
 
@@ -354,7 +355,10 @@ function renderEvents() {
           const lot = m.material_lot_code
             ? `<span class="lot-badge ${m.material_lot_status === 'FLAGGED' ? 'flagged' : 'known'}">批号 ${esc(m.material_lot_code)}${m.material_lot_status === 'FLAGGED' ? '（已通报异常）' : ''}</span>`
             : '<span class="lot-badge unknown">批号未知</span>';
-          return `${esc(m.material_name)}(${esc(m.material_code)}) ${lot}`;
+          const qty = m.qty_grams != null
+            ? `<span class="lot-badge known">${m.qty_grams} 克</span>`
+            : (m.material_lot_code ? '<span class="lot-badge unknown">缺数量·未计领用</span>' : '');
+          return `${esc(m.material_name)}(${esc(m.material_code)}) ${lot}${qty}`;
         }).join('、') : '—'}
           ｜<b>引用批次：</b>${refs.length ? refs.map((r) => esc(r.ref_batch_code)).join('、') : '—'}</div>`;
     } else {
@@ -475,20 +479,31 @@ function fillEventModalOptions(ev) {
     .join('');
   // 每个选中原料可再选一个供应批号；同一原料需要多个批号时用“＋ 同原料再加一个批号”追加一行。
   // 不选批号 = 批号未知（旧事件与只传 material_ids 的写入均为此语义）。
+  // 已启用计量的批号选中后必须填正整数克数（输入框随批号选择启停）。
   $('#evMaterials').innerHTML = state.materials.map((m) => {
     const evInputs = ev ? ev.inputs.filter((i) => i.material_id === m.id) : [];
     const checked = evInputs.length > 0;
     const lotOptions = (sel) =>
       `<option value="">批号未知（无法排除）</option>` +
       (m.lots || []).map((l) =>
-        `<option value="${l.id}" ${sel === l.id ? 'selected' : ''}>${esc(l.lot_code)}${l.flagged ? '（已通报异常）' : ''}</option>`
+        `<option value="${l.id}" ${sel === l.id ? 'selected' : ''}>${esc(l.lot_code)}${l.flagged ? '（已通报异常）' : ''}${l.metered ? '〔已计量〕' : ''}</option>`
       ).join('');
+    const qtyCell = (inp) => {
+      const selLot = inp && inp.material_lot_id
+        ? (m.lots || []).find((x) => x.id === inp.material_lot_id) : null;
+      const metered = !!(selLot && selLot.metered);
+      const qty = inp && inp.qty_grams != null ? inp.qty_grams : '';
+      return `<input type="number" class="lot-qty" min="1" step="1" placeholder="克数"
+        value="${qty}" ${metered ? 'required' : 'disabled'} style="max-width:110px">
+        <small class="hint lot-qty-hint">${metered ? '正整数克' : '未计量/未知'}</small>`;
+    };
     const rows = evInputs.length
-      ? evInputs.map((inp, idx) => `
+      ? evInputs.map((inp) => `
           <div class="lot-pick-row" data-material="${m.id}">
             <label class="lot-mat"><input type="checkbox" name="material_ids" value="${m.id}" checked>
               ${esc(m.name)} <span class="batch-meta">[${esc(m.allergens.join('/') || '无过敏原')}]</span></label>
-            <select name="lot_id" class="lot-select" ${idx > 0 ? '' : ''}>${lotOptions(inp.material_lot_id)}</select>
+            <select name="lot_id" class="lot-select">${lotOptions(inp.material_lot_id)}</select>
+            ${qtyCell(inp)}
             <button type="button" class="btn small lot-add" data-material="${m.id}">＋ 同原料再加批号</button>
             <button type="button" class="btn small danger lot-del">移除</button>
           </div>`).join('')
@@ -496,15 +511,36 @@ function fillEventModalOptions(ev) {
            <label class="lot-mat"><input type="checkbox" name="material_ids" value="${m.id}" ${checked ? 'checked' : ''}>
              ${esc(m.name)} <span class="batch-meta">[${esc(m.allergens.join('/') || '无过敏原')}]</span></label>
            <select name="lot_id" class="lot-select">${lotOptions(null)}</select>
+           ${qtyCell(null)}
            <button type="button" class="btn small lot-add" data-material="${m.id}">＋ 同原料再加批号</button>
            <button type="button" class="btn small danger lot-del" hidden>移除</button>
          </div>`;
     return `<div class="lot-pick-group" data-material-group="${m.id}">${rows}</div>`;
   }).join('');
+  $$('#evMaterials .lot-pick-row').forEach(syncLotQtyRow);
   refreshRefBatchOptions(ev);
 }
 
-// 事件弹窗内：同原料多批号行的增删（至少保留每个勾选原料一行）
+// 根据一行所选批号是否已启用计量，启用/禁用并校验该行的克数输入框。
+function syncLotQtyRow(row) {
+  const sel = row.querySelector('select.lot_id');
+  const qty = row.querySelector('input.lot-qty');
+  const hint = row.querySelector('.lot-qty-hint');
+  if (!qty) return;
+  const mid = parseInt(row.dataset.material, 10);
+  const m = state.materials.find((x) => x.id === mid);
+  const lot = sel && sel.value ? (m.lots || []).find((x) => String(x.id) === sel.value) : null;
+  const metered = !!(lot && lot.metered);
+  qty.disabled = !metered;
+  qty.required = metered;
+  if (!metered) qty.value = '';
+  if (hint) hint.textContent = metered ? '正整数克' : '未计量/未知';
+}
+// 事件弹窗内：同原料多批号行的增删（至少保留每个勾选原料一行）；批号切换时同步克数框。
+$('#evMaterials').addEventListener('change', (e) => {
+  const row = e.target.closest('.lot-pick-row');
+  if (row && e.target.classList.contains('lot-select')) syncLotQtyRow(row);
+});
 $('#evMaterials').addEventListener('click', (e) => {
   const addBtn = e.target.closest('.lot-add');
   const delBtn = e.target.closest('.lot-del');
@@ -518,6 +554,7 @@ $('#evMaterials').addEventListener('click', (e) => {
     clone.querySelector('input[name="material_ids"]').checked = true;
     clone.querySelector('.lot-del').hidden = false;
     row.parentElement.appendChild(clone);
+    syncLotQtyRow(clone);
     void m;
   } else if (delBtn && group.querySelectorAll('.lot-pick-row').length > 1) {
     row.remove();
@@ -580,16 +617,27 @@ $('#eventForm').onsubmit = async (e) => {
   e.preventDefault();
   const f = e.target;
   // 从带批号的行收集原料输入：勾选原料的每一行都提交（可同原料多行多批号；空批号=批号未知）。
+  // 已启用计量批号随提交正整数克数 qty_grams（未计量/未知行不提交克数）。
   const materialInputs = [];
-  $$('#evMaterials .lot-pick-row').forEach((row) => {
+  for (const row of $$('#evMaterials .lot-pick-row')) {
     const cb = row.querySelector('input[name="material_ids"]');
-    if (!cb.checked) return;
+    if (!cb.checked) continue;
     const sel = row.querySelector('select.lot_id');
-    materialInputs.push({
+    const qtyEl = row.querySelector('input.lot-qty');
+    const inp = {
       material_id: parseInt(row.dataset.material, 10),
       lot_id: sel && sel.value ? parseInt(sel.value, 10) : null
-    });
-  });
+    };
+    if (qtyEl && !qtyEl.disabled && qtyEl.value !== '') {
+      const n = parseInt(qtyEl.value, 10);
+      if (!Number.isInteger(n) || n <= 0) {
+        notice('error', '领用克数必须是大于 0 的正整数');
+        return;
+      }
+      inp.qty_grams = n;
+    }
+    materialInputs.push(inp);
+  }
   const isPartialClean = f.type.value === 'CLEAN' && f.clean_mode && f.clean_mode.value === 'PARTIAL';
   const cleanAllergens = isPartialClean
     ? [...new Set($('#evCleanAllergens').value.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean))]
@@ -1223,6 +1271,7 @@ function renderLots() {
         : '<span class="badge active">正常</span>'}</td>
       <td>${esc(l.note || '')}${l.flagged_reason ? `<div class="batch-meta">${esc(l.flagged_reason)}</div>` : ''}</td>
       <td class="row-actions">
+        <button class="btn small" onclick="goInventory(${l.id})">库存</button>
         <button class="btn small" onclick="traceLot(${m.id},${l.id})">追溯流向</button>
         ${l.flagged
           ? `<button class="btn small" onclick="unflagLot(${l.id})">解除标记</button>`
@@ -1282,6 +1331,132 @@ window.deleteLot = async function (id) {
     await refresh();
     notice('ok', '供应批号已删除');
   } catch (err) { notice('error', err.error || '删除失败', err.details); }
+};
+
+// ================= 批号库存（克） =================
+function renderInventory() {
+  const lots = state.lot_inventory || [];
+  const summary = state.lot_inventory_summary || { lot_count: lots.length, metered_lot_count: 0, unmeasured_input_count: 0 };
+  $('#invSummary').textContent =
+    `共 ${summary.lot_count} 个批号，已启用计量 ${summary.metered_lot_count} 个；` +
+    `全部原料输入中未计量（缺少数量）${summary.unmeasured_input_count} 笔（保留且不计入领用，更正时须补量）。`;
+
+  $('#invRows').innerHTML = lots.length ? lots.map((l) => {
+    const meteredBadge = l.metered
+      ? '<span class="badge confirmed">已计量</span>'
+      : '<span class="badge">未启用</span>';
+    const availCls = l.metered && l.available_qty <= 0 ? 'inv-zero' : '';
+    const unmeas = l.unmeasured_input_count > 0
+      ? `<span class="badge unresolved">${l.unmeasured_input_count} 笔</span>`
+      : '0';
+    return `
+    <tr>
+      <td>${esc(l.material_name)} <span class="batch-meta">(${esc(l.material_code)})</span></td>
+      <td>${esc(l.lot_code)}</td>
+      <td>${meteredBadge}</td>
+      <td>${l.opening_qty == null ? '—' : l.opening_qty}</td>
+      <td>${l.inbound_qty == null ? '—' : l.inbound_qty}</td>
+      <td>${l.used_qty}</td>
+      <td class="${availCls}"><b>${l.available_qty == null ? '—' : l.available_qty}</b></td>
+      <td>${unmeas}</td>
+      <td class="row-actions">
+        ${l.metered
+          ? `<button class="btn small" onclick="openInboundModal(${l.lot_id})">登记入库</button>
+             <button class="btn small" onclick="showInvDetail(${l.lot_id})">流水</button>`
+          : `<button class="btn small" onclick="openOpeningModal(${l.lot_id})">登记期初</button>`}
+      </td>
+    </tr>`;
+  }).join('')
+    : '<tr><td colspan="9" class="batch-meta">尚无供应批号；请先到“原料与设备”登记批号。</td></tr>';
+  renderInvDetail();
+}
+
+let invDetailLotId = null;
+function renderInvDetail() {
+  const box = $('#invDetail');
+  if (invDetailLotId == null) { box.innerHTML = ''; return; }
+  const l = (state.lot_inventory || []).find((x) => x.lot_id === invDetailLotId);
+  if (!l) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <h3 class="sub-head">${esc(l.lot_code)}（${esc(l.material_code)}）期初与入库流水</h3>
+    <table class="grid">
+      <thead><tr><th>类型</th><th>单号</th><th>克数</th><th>操作人</th><th>时间</th><th>备注</th></tr></thead>
+      <tbody>
+        ${l.opening ? `<tr>
+          <td><span class="badge confirmed">期初结存</span></td><td>—</td>
+          <td>${l.opening.quantity_grams}</td><td>${esc(l.opening.registered_by)}</td>
+          <td>${esc(fmtTime(l.opening.registered_at))}</td><td>${esc(l.opening.note || '')}</td></tr>` : ''}
+        ${(l.inbound || []).map((r) => `
+          <tr><td><span class="badge active">入库</span></td><td>${esc(r.receipt_code)}</td>
+          <td>${r.quantity_grams}</td><td>${esc(r.received_by)}</td>
+          <td>${esc(fmtTime(r.received_at))}</td><td>${esc(r.note || '')}</td></tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+window.openOpeningModal = function (lotId) {
+  const l = (state.lot_inventory || []).find((x) => x.lot_id === lotId);
+  if (!l) return;
+  const f = $('#openingForm');
+  f.reset();
+  f.lot_id.value = lotId;
+  f.lot_label.value = `${l.material_name}（${l.material_code}） ${l.lot_code}`;
+  $('#openingModal').classList.remove('hidden');
+};
+window.openInboundModal = function (lotId) {
+  const l = (state.lot_inventory || []).find((x) => x.lot_id === lotId);
+  if (!l) return;
+  const f = $('#inboundForm');
+  f.reset();
+  f.lot_id.value = lotId;
+  f.lot_label.value = `${l.material_name}（${l.material_code}） ${l.lot_code}`;
+  $('#inboundModal').classList.remove('hidden');
+  invDetailLotId = lotId;
+};
+window.showInvDetail = function (lotId) { invDetailLotId = lotId; renderInvDetail(); };
+// 从“原料与设备”批号行跳转：切换到库存页并展开该批号流水。
+window.goInventory = function (lotId) {
+  $$('.tab').find((x) => x.dataset.tab === 'inventory').click();
+  invDetailLotId = lotId;
+  renderInvDetail();
+};
+
+$('#openingForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    const body = {
+      quantity_grams: parseInt(f.quantity_grams.value, 10),
+      registered_by: f.registered_by.value.trim(),
+      note: f.note.value.trim()
+    };
+    if (f.registered_at.value) body.registered_at = f.registered_at.value;
+    await api(`/api/material-lots/${f.lot_id.value}/opening-balance`, { method: 'POST', body });
+    $('#openingModal').classList.add('hidden');
+    await refresh();
+    invDetailLotId = parseInt(f.lot_id.value, 10);
+    renderInvDetail();
+    notice('ok', '期初实物结存已登记，批号启用计量；此后该批号每笔原料输入须填正整数克数');
+  } catch (err) { notice('error', err.error || '登记失败', err.details); }
+};
+$('#inboundForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    const body = {
+      quantity_grams: parseInt(f.quantity_grams.value, 10),
+      received_by: f.received_by.value.trim(),
+      note: f.note.value.trim()
+    };
+    if (f.receipt_code.value.trim()) body.receipt_code = f.receipt_code.value.trim();
+    if (f.received_at.value) body.received_at = f.received_at.value;
+    const r = await api(`/api/material-lots/${f.lot_id.value}/inbound`, { method: 'POST', body });
+    $('#inboundModal').classList.add('hidden');
+    await refresh();
+    invDetailLotId = parseInt(f.lot_id.value, 10);
+    renderInvDetail();
+    notice('ok', `入库已登记（单号 ${r.receipt_code}），当前可用量 ${r.balance.available_qty} 克`);
+  } catch (err) { notice('error', err.error || '登记失败', err.details); }
 };
 
 // ================= 原料批号追溯 =================
